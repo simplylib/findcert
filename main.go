@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"database/sql"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,44 +17,11 @@ import (
 	"github.com/simplylib/multierror"
 )
 
-const certificateQuery = `
-WITH ci AS (
-    SELECT min(sub.CERTIFICATE_ID) ID,
-           min(sub.ISSUER_CA_ID) ISSUER_CA_ID,
-           array_agg(DISTINCT sub.NAME_VALUE) NAME_VALUES,
-           x509_commonName(sub.CERTIFICATE) COMMON_NAME,
-           x509_notBefore(sub.CERTIFICATE) NOT_BEFORE,
-           x509_notAfter(sub.CERTIFICATE) NOT_AFTER,
-           encode(x509_serialNumber(sub.CERTIFICATE), 'hex') SERIAL_NUMBER
-        FROM (SELECT *
-                  FROM certificate_and_identities cai
-                  WHERE plainto_tsquery('certwatch', $1) @@ identities(cai.CERTIFICATE)
-                      AND cai.NAME_VALUE ILIKE ('%' || $1 || '%')
-                      AND cai.NAME_TYPE = '2.5.4.3' -- commonName
-             ) sub
-        GROUP BY sub.CERTIFICATE
-)
-SELECT ci.ISSUER_CA_ID,
-        ca.NAME ISSUER_NAME,
-        array_to_string(ci.NAME_VALUES, chr(10)) NAME_VALUE,
-        ci.ID ID,
-        le.ENTRY_TIMESTAMP,
-        ci.NOT_BEFORE,
-        ci.NOT_AFTER,
-        ci.SERIAL_NUMBER
-    FROM ci
-            LEFT JOIN LATERAL (
-                SELECT min(ctle.ENTRY_TIMESTAMP) ENTRY_TIMESTAMP
-                    FROM ct_log_entry ctle
-                    WHERE ctle.CERTIFICATE_ID = ci.ID
-            ) le ON TRUE,
-         ca
-    WHERE ci.ISSUER_CA_ID = ca.ID
-    ORDER BY le.ENTRY_TIMESTAMP DESC NULLS LAST LIMIT $2;
-`
+const certificateQuery = "SELECT certificate FROM certificate_and_identities WHERE name_value LIKE $1 ORDER BY certificate_id DESC LIMIT $2;"
 
-func getCertificates(ctx context.Context, domainName string, limit int) ([]string, error) {
-	db, err := sql.Open("postgres", "host=crt.sh user=guest dbname=certwatch")
+// getCertificates as a slice of bytes in the der format
+func getCertificates(ctx context.Context, domainName string, limit int) (certs [][]byte, err error) {
+	db, err := sql.Open("postgres", "host=crt.sh user=guest dbname=certwatch binary_parameters=yes")
 	if err != nil {
 		return nil, fmt.Errorf("could not open SQL connection to postgres at crt.sh due to error (%w)", err)
 	}
@@ -62,16 +31,13 @@ func getCertificates(ctx context.Context, domainName string, limit int) ([]strin
 		}
 	}()
 
-	stmt, err := db.PrepareContext(ctx, certificateQuery)
-	if err != nil {
-		log.Printf("%T", err)
-		return nil, fmt.Errorf("could not prepare SQL query (%w)", err)
-	}
-	defer func() {
-		err = multierror.Append(err, stmt.Close())
-	}()
-
-	rows, err := stmt.QueryContext(ctx, domainName, limit)
+	var rows *sql.Rows
+	rows, err = db.QueryContext(
+		ctx,
+		certificateQuery,
+		domainName,
+		limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("could not execute SQL on postgres for finding certificates (%w)", err)
 	}
@@ -79,34 +45,23 @@ func getCertificates(ctx context.Context, domainName string, limit int) ([]strin
 		err = multierror.Append(err, rows.Close())
 	}()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("could not get columns (%w)", err)
-	}
-
-	_ = columns
-
 	var (
-		one   string
-		two   string
-		three string
-		four  string
-		five  string
-		six   string
-		seven string
-		eight string
+		der  []byte
+		ders [][]byte
 	)
 	for rows.Next() {
-		err = rows.Scan(&one, &two, &three, &four, &five, &six, &seven, &eight)
+		err = rows.Scan(&der)
 		if err != nil {
 			return nil, fmt.Errorf("could not scan row (%w)", err)
 		}
 
-		log.Println(one, two, three, four, five, six, seven, eight)
+		ders = append(ders, der)
 	}
 
-	return nil, nil
+	return ders, nil
 }
+
+var errExpectedArguments = errors.New("expected 1 argument: domain name")
 
 func run() error {
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -125,6 +80,7 @@ func run() error {
 
 	verbose := flag.Bool("v", false, "be verbose")
 	limit := flag.Int("n", 1, "number of entries to return")
+	printPEM := flag.Bool("pem", false, "print PEM encoded certificate")
 
 	flag.CommandLine.Usage = func() {
 		fmt.Fprint(flag.CommandLine.Output(),
@@ -143,15 +99,33 @@ func run() error {
 	}
 
 	if flag.NArg() != 1 {
-		return errors.New("expected 1 argument: domain name")
+		return errExpectedArguments
 	}
 
-	certs, err := getCertificates(ctx, flag.Args()[0], *limit)
+	ders, err := getCertificates(ctx, flag.Args()[0], *limit)
 	if err != nil {
 		return fmt.Errorf("could not getCertificates of (%v) error (%w)", flag.Args()[0], err)
 	}
 
-	log.Println(certs)
+	var cert *x509.Certificate
+	for _, der := range ders {
+		cert, err = x509.ParseCertificate(der)
+		if err != nil {
+			return fmt.Errorf("could not parse x509 certificate (%w)", err)
+		}
+
+		log.Printf("CommonName: (%v) Issued On: (%v)\n", cert.Subject.CommonName, cert.NotBefore)
+
+		if *printPEM {
+			err = pem.Encode(log.Default().Writer(), &pem.Block{
+				Type:  "CERTIFICATE",
+				Bytes: []byte(der),
+			})
+			if err != nil {
+				return fmt.Errorf("could not encode PEM (%w)", err)
+			}
+		}
+	}
 
 	return nil
 }
